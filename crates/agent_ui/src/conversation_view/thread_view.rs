@@ -384,6 +384,7 @@ impl ThreadView {
         thread_store: Option<Entity<ThreadStore>>,
         prompt_store: Option<Entity<PromptStore>>,
         initial_content: Option<AgentInitialContent>,
+        restored_pending_input: Option<super::PendingInputSnapshot>,
         mut subscriptions: Vec<Subscription>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -396,6 +397,26 @@ impl ThreadView {
 
         let mut should_auto_submit = false;
         let mut show_external_source_prompt_warning = false;
+        let restored_draft_prompt = restored_pending_input
+            .as_ref()
+            .map(|snapshot| snapshot.draft_prompt.clone());
+
+        let restored_queued_messages = restored_pending_input
+            .as_ref()
+            .map(|snapshot| snapshot.queued_messages.clone())
+            .or_else(|| {
+                parent_session_id
+                    .is_none()
+                    .then(|| crate::draft_prompt_store::read_queued_messages(root_thread_id, cx))
+                    .flatten()
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .map(|content| QueuedMessage {
+                content,
+                tracked_buffers: Vec::new(),
+            })
+            .collect::<Vec<_>>();
 
         let message_editor = cx.new(|cx| {
             let mut editor = MessageEditor::new(
@@ -438,8 +459,22 @@ impl ThreadView {
                         );
                     }
                 }
-            } else if let Some(draft) = thread.read(cx).draft_prompt() {
-                editor.set_message(draft.to_vec(), window, cx);
+            } else if let Some(draft) = restored_draft_prompt.as_ref() {
+                if !draft.is_empty() {
+                    editor.set_message(draft.clone(), window, cx);
+                }
+            } else if let Some(draft) = thread
+                .read(cx)
+                .draft_prompt()
+                .map(|draft| draft.to_vec())
+                .or_else(|| {
+                    parent_session_id
+                        .is_none()
+                        .then(|| crate::draft_prompt_store::read(root_thread_id, cx))
+                        .flatten()
+                })
+            {
+                editor.set_message(draft, window, cx);
             }
             editor
         });
@@ -579,7 +614,6 @@ impl ThreadView {
             editor_expanded: false,
             should_be_following: false,
             editing_message: None,
-            local_queued_messages: Vec::new(),
             queued_message_editors: Vec::new(),
             queued_message_editor_subscriptions: Vec::new(),
             last_synced_queue_length: 0,
@@ -605,9 +639,11 @@ impl ThreadView {
             multi_root_callout_dismissed: false,
             generating_indicator_in_list: false,
             skill_loading_errors: Vec::new(),
+            local_queued_messages: restored_queued_messages,
             dismissed_skill_loading_errors: HashSet::default(),
         };
 
+        this.sync_queue_flag_to_native_thread(cx);
         this.sync_generating_indicator(cx);
         this.sync_editor_mode_for_empty_state(cx);
         let list_state_for_scroll = this.list_state.clone();
@@ -763,6 +799,21 @@ impl ThreadView {
 
     pub fn has_queued_messages(&self) -> bool {
         !self.local_queued_messages.is_empty()
+    }
+
+    pub fn persist_pending_input(&mut self, cx: &mut Context<Self>) -> Vec<Vec<acp::ContentBlock>> {
+        let composer = self
+            .message_editor
+            .read(cx)
+            .draft_content_blocks_snapshot(cx);
+        self.thread.update(cx, |thread, cx| {
+            thread.set_draft_prompt((!composer.is_empty()).then_some(composer.clone()), cx);
+        });
+
+        self.local_queued_messages
+            .iter()
+            .map(|queued_message| queued_message.content.clone())
+            .collect()
     }
 
     pub fn is_imported_thread(&self, cx: &App) -> bool {

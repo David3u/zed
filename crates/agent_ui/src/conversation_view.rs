@@ -109,6 +109,12 @@ pub struct QueuedMessage {
     pub tracked_buffers: Vec<Entity<Buffer>>,
 }
 
+#[derive(Clone, Default)]
+pub(super) struct PendingInputSnapshot {
+    draft_prompt: Vec<acp::ContentBlock>,
+    queued_messages: Vec<Vec<acp::ContentBlock>>,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum ThreadFeedback {
     Positive,
@@ -720,6 +726,7 @@ impl ConversationView {
         ];
 
         cx.on_release(|this, cx| {
+            this.persist_pending_input_snapshot(cx);
             if let Some(connected) = this.as_connected() {
                 connected.close_all_sessions(cx).detach();
             }
@@ -755,6 +762,7 @@ impl ConversationView {
                 title,
                 project,
                 initial_content,
+                None,
                 source,
                 window,
                 cx,
@@ -769,7 +777,15 @@ impl ConversationView {
         }
     }
 
-    fn set_server_state(&mut self, state: ServerState, cx: &mut Context<Self>) {
+    fn set_server_state(
+        &mut self,
+        state: ServerState,
+        persist_pending_input: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if persist_pending_input {
+            self.persist_pending_input_snapshot(cx);
+        }
         if let Some(connected) = self.as_connected() {
             connected.close_all_sessions(cx).detach();
         }
@@ -780,6 +796,62 @@ impl ConversationView {
             cx.emit(RootThreadUpdated);
         }
         cx.notify();
+    }
+
+    fn capture_pending_input(&mut self, cx: &mut App) -> Option<PendingInputSnapshot> {
+        let Some(thread_view) = self.root_thread_view() else {
+            return None;
+        };
+
+        let snapshot = thread_view.update(cx, |thread_view, cx| {
+            let queued_messages = thread_view.persist_pending_input(cx);
+            let draft_prompt = thread_view
+                .thread
+                .read(cx)
+                .draft_prompt()
+                .map(|draft_prompt| draft_prompt.to_vec())
+                .unwrap_or_default();
+            PendingInputSnapshot {
+                draft_prompt,
+                queued_messages,
+            }
+        });
+
+        Self::persist_draft_prompt_snapshot(self.thread_id, &snapshot.draft_prompt, cx)
+            .detach_and_log_err(cx);
+        Some(snapshot)
+    }
+
+    fn persist_pending_input_snapshot(&mut self, cx: &mut App) {
+        let Some(snapshot) = self.capture_pending_input(cx) else {
+            return;
+        };
+        Self::persist_queued_messages_snapshot(self.thread_id, &snapshot.queued_messages, cx)
+            .detach_and_log_err(cx);
+    }
+
+    fn persist_draft_prompt_snapshot(
+        thread_id: ThreadId,
+        snapshot: &[acp::ContentBlock],
+        cx: &App,
+    ) -> Task<anyhow::Result<()>> {
+        if snapshot.is_empty() {
+            crate::draft_prompt_store::delete(thread_id, cx)
+        } else {
+            crate::draft_prompt_store::write(thread_id, snapshot, cx)
+        }
+    }
+
+    fn persist_queued_messages_snapshot(
+        thread_id: ThreadId,
+        snapshot: &[Vec<acp::ContentBlock>],
+        cx: &App,
+    ) -> Task<anyhow::Result<()>> {
+        if snapshot.is_empty() {
+            crate::draft_prompt_store::delete_queued_messages(thread_id, cx)
+        } else {
+            crate::draft_prompt_store::write_queued_messages(thread_id, snapshot, cx)
+        }
     }
 
     fn reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -807,6 +879,12 @@ impl ConversationView {
                 (session_id, work_dirs, title)
             });
 
+        let pending_input = self.capture_pending_input(cx);
+        if let Some(snapshot) = pending_input.as_ref() {
+            Self::persist_queued_messages_snapshot(self.thread_id, &snapshot.queued_messages, cx)
+                .detach_and_log_err(cx);
+        }
+
         let state = Self::initial_state(
             self.agent.clone(),
             self.connection_store.clone(),
@@ -816,11 +894,12 @@ impl ConversationView {
             title,
             self.project.clone(),
             None,
+            pending_input,
             AgentThreadSource::AgentPanel,
             window,
             cx,
         );
-        self.set_server_state(state, cx);
+        self.set_server_state(state, false, cx);
 
         if let Some(view) = self.root_thread_view() {
             view.update(cx, |this, cx| {
@@ -841,6 +920,7 @@ impl ConversationView {
         title: Option<SharedString>,
         project: Entity<Project>,
         initial_content: Option<AgentInitialContent>,
+        restored_pending_input: Option<PendingInputSnapshot>,
         source: AgentThreadSource,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -975,6 +1055,7 @@ impl ConversationView {
                             conversation.clone(),
                             resumed_without_history,
                             initial_content,
+                            restored_pending_input,
                             window,
                             cx,
                         );
@@ -997,6 +1078,7 @@ impl ConversationView {
                                 conversation,
                                 _connection_entry_subscription: connection_entry_subscription,
                             }),
+                            true,
                             cx,
                         );
                     }
@@ -1027,6 +1109,7 @@ impl ConversationView {
         conversation: Entity<Conversation>,
         resumed_without_history: bool,
         initial_content: Option<AgentInitialContent>,
+        restored_pending_input: Option<PendingInputSnapshot>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<ThreadView> {
@@ -1196,6 +1279,7 @@ impl ConversationView {
                         .and_then(|a| a.icon_path().cloned())
                 })
             });
+        let is_root_thread = thread.read(cx).parent_session_id().is_none();
 
         let weak = cx.weak_entity();
         cx.new(|cx| {
@@ -1221,6 +1305,9 @@ impl ConversationView {
                 self.thread_store.clone(),
                 self.prompt_store.clone(),
                 initial_content,
+                is_root_thread
+                    .then(|| restored_pending_input.clone())
+                    .flatten(),
                 subscriptions,
                 window,
                 cx,
@@ -1302,6 +1389,7 @@ impl ConversationView {
                         conversation: cx.new(|_cx| Conversation::default()),
                         _connection_entry_subscription: Subscription::new(|| {}),
                     }),
+                    true,
                     cx,
                 );
             }
@@ -1322,7 +1410,7 @@ impl ConversationView {
             }
         }
         self.emit_load_error_telemetry(&err);
-        self.set_server_state(ServerState::LoadError { error: err }, cx);
+        self.set_server_state(ServerState::LoadError { error: err }, true, cx);
     }
 
     fn handle_agent_servers_updated(
@@ -1625,6 +1713,7 @@ impl ConversationView {
                     ServerState::LoadError {
                         error: error.clone(),
                     },
+                    true,
                     cx,
                 );
             }
@@ -1735,11 +1824,9 @@ impl ConversationView {
                     .draft_prompt()
                     .map(|p| p.to_vec())
                     .unwrap_or_default();
-                Some(if snapshot.is_empty() {
-                    crate::draft_prompt_store::delete(thread_id, cx)
-                } else {
-                    crate::draft_prompt_store::write(thread_id, &snapshot, cx)
-                })
+                Some(Self::persist_draft_prompt_snapshot(
+                    thread_id, &snapshot, cx,
+                ))
             });
             if let Ok(Some(persist)) = persist {
                 persist.await.log_err();
@@ -1931,8 +2018,15 @@ impl ConversationView {
                 conversation.update(cx, |conversation, cx| {
                     conversation.register_thread(subagent_thread.clone(), cx);
                 });
-                let view =
-                    this.new_thread_view(subagent_thread, conversation, false, None, window, cx);
+                let view = this.new_thread_view(
+                    subagent_thread,
+                    conversation,
+                    false,
+                    None,
+                    None,
+                    window,
+                    cx,
+                );
                 let Some(connected) = this.as_connected_mut() else {
                     return;
                 };
@@ -7914,6 +8008,139 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_reset_restores_pending_input_snapshot(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(CloseCapableConnection::new()), cx).await;
+
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("draft", window, cx);
+        });
+        active_thread(&conversation_view, cx).update_in(cx, |thread_view, _window, cx| {
+            thread_view.add_to_queue(
+                vec![acp::ContentBlock::Text(acp::TextContent::new("queued"))],
+                vec![],
+                cx,
+            );
+        });
+
+        conversation_view.update_in(cx, |view, window, cx| {
+            view.reset(window, cx);
+        });
+        cx.run_until_parked();
+
+        let restored_editor_text =
+            message_editor(&conversation_view, cx).read_with(cx, |editor, cx| editor.text(cx));
+        let persisted = cx
+            .update(|_, cx| {
+                crate::draft_prompt_store::read_queued_messages(
+                    conversation_view.read(cx).thread_id,
+                    cx,
+                )
+            })
+            .expect("queued messages should be persisted before reset reloads the thread");
+        assert_eq!(
+            restored_editor_text, "draft",
+            "composer text should survive reset via the draft prompt snapshot"
+        );
+
+        let restored_queue = active_thread(&conversation_view, cx).read_with(cx, |thread, _cx| {
+            thread
+                .local_queued_messages
+                .iter()
+                .map(|queued_message| {
+                    queued_message
+                        .content
+                        .iter()
+                        .map(|block| match block {
+                            acp::ContentBlock::Text(text) => text.text.clone(),
+                            _ => panic!("expected only text blocks in restored queued message"),
+                        })
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(restored_queue, vec!["queued".to_string()]);
+        assert_eq!(
+            persisted,
+            vec![vec![acp::ContentBlock::Text(acp::TextContent::new(
+                "queued"
+            ))]]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_reconnect_restores_pending_input_snapshot(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = CloseCapableConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("draft after disconnect", window, cx);
+        });
+        active_thread(&conversation_view, cx).update_in(cx, |thread_view, _window, cx| {
+            thread_view.add_to_queue(
+                vec![acp::ContentBlock::Text(acp::TextContent::new(
+                    "queued after disconnect",
+                ))],
+                vec![],
+                cx,
+            );
+            thread_view.thread.update(cx, |thread, cx| {
+                thread.emit_load_error(LoadError::Other("simulated disconnect".into()), cx);
+            });
+        });
+        cx.run_until_parked();
+
+        conversation_view.read_with(cx, |view, _cx| {
+            assert!(
+                matches!(view.server_state, ServerState::LoadError { .. }),
+                "disconnect should transition the conversation into LoadError"
+            );
+        });
+
+        let project = conversation_view.read_with(cx, |view, _cx| view.project.clone());
+        project.update(cx, |project, cx| {
+            project
+                .agent_server_store()
+                .update(cx, |_store, cx| cx.emit(project::AgentServersUpdated));
+        });
+        cx.run_until_parked();
+
+        let restored_editor_text =
+            message_editor(&conversation_view, cx).read_with(cx, |editor, cx| editor.text(cx));
+        assert_eq!(
+            restored_editor_text, "draft after disconnect",
+            "composer text should survive reconnect via the in-memory snapshot"
+        );
+
+        let restored_queue = active_thread(&conversation_view, cx).read_with(cx, |thread, _cx| {
+            thread
+                .local_queued_messages
+                .iter()
+                .map(|queued_message| {
+                    queued_message
+                        .content
+                        .iter()
+                        .map(|block| match block {
+                            acp::ContentBlock::Text(text) => text.text.clone(),
+                            _ => panic!("expected only text blocks in restored queued message"),
+                        })
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            restored_queue,
+            vec!["queued after disconnect".to_string()],
+            "queued messages should survive reconnect via the same snapshot path"
+        );
+    }
+
+    #[gpui::test]
     async fn test_close_session_returns_error_when_unsupported(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -7960,6 +8187,34 @@ pub(crate) mod tests {
                 closed_sessions: Arc::new(Mutex::new(Vec::new())),
             }
         }
+
+        fn thread_for_session(
+            self: Rc<Self>,
+            project: Entity<Project>,
+            work_dirs: PathList,
+            session_id: acp::SessionId,
+            cx: &mut App,
+        ) -> Entity<AcpThread> {
+            let action_log = cx.new(|_| ActionLog::new(project.clone()));
+            cx.new(|cx| {
+                AcpThread::new(
+                    None,
+                    Some("CloseCapableConnection".into()),
+                    Some(work_dirs),
+                    self,
+                    project,
+                    action_log,
+                    session_id,
+                    watch::Receiver::constant(
+                        acp::PromptCapabilities::new()
+                            .image(true)
+                            .audio(true)
+                            .embedded_context(true),
+                    ),
+                    cx,
+                )
+            })
+        }
     }
 
     impl AgentConnection for CloseCapableConnection {
@@ -7977,26 +8232,30 @@ pub(crate) mod tests {
             work_dirs: PathList,
             cx: &mut gpui::App,
         ) -> Task<gpui::Result<Entity<AcpThread>>> {
-            let action_log = cx.new(|_| ActionLog::new(project.clone()));
-            let thread = cx.new(|cx| {
-                AcpThread::new(
-                    None,
-                    Some("CloseCapableConnection".into()),
-                    Some(work_dirs),
-                    self,
-                    project,
-                    action_log,
-                    acp::SessionId::new("close-capable-session"),
-                    watch::Receiver::constant(
-                        acp::PromptCapabilities::new()
-                            .image(true)
-                            .audio(true)
-                            .embedded_context(true),
-                    ),
-                    cx,
-                )
-            });
+            let thread = self.thread_for_session(
+                project,
+                work_dirs,
+                acp::SessionId::new("close-capable-session"),
+                cx,
+            );
             Task::ready(Ok(thread))
+        }
+
+        fn supports_load_session(&self) -> bool {
+            true
+        }
+
+        fn load_session(
+            self: Rc<Self>,
+            session_id: acp::SessionId,
+            project: Entity<Project>,
+            work_dirs: PathList,
+            _title: Option<SharedString>,
+            cx: &mut App,
+        ) -> Task<Result<Entity<AcpThread>>> {
+            Task::ready(Ok(
+                self.thread_for_session(project, work_dirs, session_id, cx)
+            ))
         }
 
         fn supports_close_session(&self) -> bool {

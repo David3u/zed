@@ -1139,6 +1139,7 @@ impl ThreadMetadataStore {
             .try_send(DbOperation::Delete(thread_id))
             .log_err();
         crate::draft_prompt_store::delete(thread_id, cx).detach_and_log_err(cx);
+        crate::draft_prompt_store::delete_queued_messages(thread_id, cx).detach_and_log_err(cx);
         cx.notify();
     }
 
@@ -1316,6 +1317,7 @@ impl ThreadMetadataStore {
             // promoted thread now owns its prompt state via the native
             // agent's thread database.
             crate::draft_prompt_store::delete(thread_id, cx).detach_and_log_err(cx);
+            crate::draft_prompt_store::delete_queued_messages(thread_id, cx).detach_and_log_err(cx);
         }
 
         let metadata = ThreadMetadata {
