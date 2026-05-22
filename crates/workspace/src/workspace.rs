@@ -4273,15 +4273,50 @@ impl Workspace {
         panel.to_any().downcast().ok()
     }
 
-    /// Focus the panel of the given type if it isn't already focused. If it is
-    /// already focused, then transfer focus back to the workspace center.
-    /// When the `close_panel_on_toggle` setting is enabled, also closes the
-    /// panel when transferring focus back to the center.
+    /// Focus the panel of the given type if it isn't visible. If it is visible,
+    /// close it and transfer focus back to the workspace center.
     pub fn toggle_panel_focus<T: Panel>(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        for dock in [
+            self.left_dock.clone(),
+            self.bottom_dock.clone(),
+            self.right_dock.clone(),
+        ] {
+            let Some(panel_index) = dock.read(cx).panel_index_for_type::<T>() else {
+                continue;
+            };
+            let dock_position = dock.read(cx).position();
+            let other_is_zoomed =
+                self.zoomed.is_some() && self.zoomed_position != Some(dock_position);
+            let panel_is_visible = dock.read(cx).is_open()
+                && dock.read(cx).active_panel_index() == Some(panel_index)
+                && !other_is_zoomed;
+
+            if panel_is_visible {
+                self.save_open_dock_positions(cx);
+                dock.update(cx, |dock, cx| {
+                    dock.set_open(false, window, cx);
+                });
+                self.active_pane
+                    .update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
+                cx.notify();
+                self.serialize_workspace(window, cx);
+
+                telemetry::event!(
+                    "Panel Button Clicked",
+                    name = T::persistent_name(),
+                    toggle_state = false
+                );
+
+                return false;
+            }
+
+            break;
+        }
+
         let mut did_focus_panel = false;
         self.focus_or_unfocus_panel::<T>(window, cx, &mut |panel, window, cx| {
             did_focus_panel = !panel.panel_focus_handle(cx).contains_focused(window, cx);
@@ -12842,8 +12877,8 @@ mod tests {
             );
         });
 
-        // Open the dock and focus something else so the panel is open but not
-        // focused. Toggling should focus the panel (not close it).
+        // Open the dock and focus something else so the panel is visible but
+        // not focused. Toggling should close the panel.
         workspace.update_in(cx, |workspace, window, cx| {
             workspace
                 .right_dock()
@@ -12859,17 +12894,17 @@ mod tests {
 
         workspace.update_in(cx, |workspace, window, cx| {
             assert!(
-                workspace.right_dock().read(cx).is_open(),
-                "Dock should remain open when toggling focuses an open-but-unfocused panel"
+                !workspace.right_dock().read(cx).is_open(),
+                "Dock should close when toggling a visible-but-unfocused panel"
             );
             assert!(
-                panel.read(cx).focus_handle(cx).contains_focused(window, cx),
-                "Panel should be focused after toggling an open-but-unfocused panel"
+                !panel.read(cx).focus_handle(cx).contains_focused(window, cx),
+                "Panel should not be focused after toggling a visible-but-unfocused panel"
             );
         });
 
-        // Now disable the setting and verify the original behavior: toggling
-        // from a focused panel moves focus to center but leaves the dock open.
+        // Disabling close_panel_on_toggle should not affect visible panel
+        // toggling. The action still opens the panel, then closes it.
         cx.update_global(|store: &mut SettingsStore, cx| {
             store.update_user_settings(cx, |settings| {
                 settings.workspace.close_panel_on_toggle = Some(false);
@@ -12883,11 +12918,26 @@ mod tests {
         workspace.update_in(cx, |workspace, window, cx| {
             assert!(
                 workspace.right_dock().read(cx).is_open(),
-                "Dock should remain open when setting is disabled"
+                "Dock should open when toggling a hidden panel"
+            );
+            assert!(
+                panel.read(cx).focus_handle(cx).contains_focused(window, cx),
+                "Panel should be focused after toggling a hidden panel"
+            );
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<TestPanel>(window, cx);
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert!(
+                !workspace.right_dock().read(cx).is_open(),
+                "Dock should close after toggling a visible panel"
             );
             assert!(
                 !panel.read(cx).focus_handle(cx).contains_focused(window, cx),
-                "Panel should not be focused after toggling with setting disabled"
+                "Panel should not be focused after toggling a visible panel"
             );
         });
     }

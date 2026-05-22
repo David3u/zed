@@ -39,7 +39,7 @@ actions!(
         ToggleWorkspaceSidebar,
         /// Closes the workspace sidebar.
         CloseWorkspaceSidebar,
-        /// Moves focus to or from the workspace sidebar without closing it.
+        /// Toggles focus on the workspace sidebar.
         FocusWorkspaceSidebar,
         /// Activates the next project in the sidebar.
         NextProject,
@@ -435,20 +435,7 @@ impl MultiWorkspace {
         }
 
         if self.sidebar_open() {
-            let sidebar_is_focused = self
-                .sidebar
-                .as_ref()
-                .is_some_and(|s| s.focus_handle(cx).contains_focused(window, cx));
-
-            if sidebar_is_focused {
-                self.restore_previous_focus(false, window, cx);
-            } else {
-                self.previous_focus_handle = window.focused(cx);
-                if let Some(sidebar) = &self.sidebar {
-                    sidebar.prepare_for_focus(window, cx);
-                    sidebar.focus(window, cx);
-                }
-            }
+            self.close_sidebar(window, cx);
         } else {
             self.previous_focus_handle = window.focused(cx);
             self.open_sidebar(cx);
