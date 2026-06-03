@@ -4190,6 +4190,9 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let project_paths = self.project.read(cx).default_path_list(cx);
+        let work_dirs = Self::usable_work_dirs(work_dirs, &project_paths);
+
         if let Some(store) = ThreadMetadataStore::try_global(cx) {
             store.update(cx, |store, cx| {
                 store.unarchive(thread_id, cx);
@@ -4258,6 +4261,15 @@ impl AgentPanel {
             window,
             cx,
         );
+    }
+
+    fn usable_work_dirs(work_dirs: Option<PathList>, project_paths: &PathList) -> Option<PathList> {
+        let paths = work_dirs?
+            .ordered_paths()
+            .filter(|path| project_paths.paths().contains(path) || path.is_dir())
+            .cloned()
+            .collect::<Vec<_>>();
+        (!paths.is_empty()).then(|| PathList::new(&paths))
     }
 
     pub(crate) fn create_agent_thread_with_server(
@@ -6387,6 +6399,14 @@ mod tests {
             terminal_program_to_report(&mut last_observed_program, Some("codex".to_string())),
             Some("codex".to_string())
         );
+    }
+
+    #[test]
+    fn test_usable_work_dirs_ignores_deleted_paths() {
+        let project_paths = PathList::new(&[Path::new("/project")]);
+        let work_dirs = PathList::new(&[Path::new("/deleted-worktree")]);
+
+        assert!(AgentPanel::usable_work_dirs(Some(work_dirs), &project_paths).is_none());
     }
 
     #[derive(Clone, Default)]
