@@ -439,7 +439,7 @@ impl LspLogView {
                     }),
             )
             .collect::<Vec<_>>();
-        rows.sort_by_key(|row| row.server_id);
+        rows.sort_unstable_by_key(|row| row.server_id);
         rows.dedup_by_key(|row| row.server_id);
         Some(rows)
     }
@@ -1363,6 +1363,7 @@ impl ServerInfo {
             capabilities: server.capabilities(),
             status: LanguageServerStatus {
                 name: server.name(),
+                language_name: None,
                 server_version: server.version(),
                 server_readable_version: server.readable_version(),
                 pending_work: Default::default(),
